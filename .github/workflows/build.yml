@@ -1,0 +1,195 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Get sources (medigor/addin-image-converter)
+        shell: bash
+        run: git clone --depth 1 https://github.com/medigor/addin-image-converter.git src
+      - name: Apply JPEG fix and static CRT
+        shell: bash
+        run: |
+          mkdir -p src/.cargo
+          cat > src/src/addin.rs <<'RUST'
+          use std::{error::Error, io::Cursor};
+
+          use addin1c::{cstr1c, AddinResult, CStr1C, MethodInfo, Methods, PropInfo, SimpleAddin, Variant};
+          use image::{codecs::jpeg::JpegEncoder, DynamicImage, ImageFormat, Rgb, RgbImage};
+
+          /// Качество JPEG (1-100). Стандартное значение библиотеки image - 75.
+          const JPEG_QUALITY: u8 = 90;
+
+          pub struct Addin {
+              last_error: Option<Box<dyn Error>>,
+          }
+
+          impl Addin {
+              pub fn new() -> Self {
+                  Self { last_error: None }
+              }
+
+              fn last_error(&mut self, value: &mut Variant) -> AddinResult {
+                  match &self.last_error {
+                      Some(err) => value
+                          .set_str1c(err.to_string().as_str())
+                          .map_err(|e| e.into()),
+                      None => value.set_str1c("").map_err(|e| e.into()),
+                  }
+              }
+
+              fn convert_file(
+                  &mut self,
+                  source: &mut Variant,
+                  destination: &mut Variant,
+                  _ret_value: &mut Variant,
+              ) -> AddinResult {
+                  let source = source.get_string()?;
+                  let destination = destination.get_string()?;
+
+                  let destination_format = ImageFormat::from_path(&destination)?;
+                  let image = image::open(&source)?;
+
+                  let buf = encode(image, destination_format)?;
+                  std::fs::write(&destination, buf)?;
+                  Ok(())
+              }
+
+              fn convert_buffer(
+                  &mut self,
+                  source: &mut Variant,
+                  source_format: &mut Variant,
+                  destination_format: &mut Variant,
+                  ret_value: &mut Variant,
+              ) -> AddinResult {
+                  let source = source.get_blob()?;
+                  let source_format = ImageFormat::from_extension(source_format.get_string()?)
+                      .ok_or("Unknown source format")?;
+                  let destination_format = ImageFormat::from_extension(destination_format.get_string()?)
+                      .ok_or("Unknown destination format")?;
+
+                  let image = image::load_from_memory_with_format(source, source_format)?;
+
+                  let buf = encode(image, destination_format)?;
+                  ret_value.set_blob(&buf)?;
+
+                  Ok(())
+              }
+          }
+
+          /// Кодирует картинку в нужный формат.
+          /// JPEG не поддерживает прозрачность и 16-битный цвет: библиотека image в этом случае
+          /// возвращает ошибку, поэтому для JPEG картинка приводится к RGB с заливкой прозрачных
+          /// областей белым цветом.
+          fn encode(image: DynamicImage, format: ImageFormat) -> Result<Vec<u8>, Box<dyn Error>> {
+              let mut buf = Vec::<u8>::new();
+              let mut cursor = Cursor::new(&mut buf);
+
+              if format == ImageFormat::Jpeg {
+                  let rgb = to_rgb_on_white(image);
+                  rgb.write_with_encoder(JpegEncoder::new_with_quality(&mut cursor, JPEG_QUALITY))?;
+              } else {
+                  image.write_to(&mut cursor, format)?;
+              }
+
+              Ok(buf)
+          }
+
+          fn to_rgb_on_white(image: DynamicImage) -> DynamicImage {
+              if !image.color().has_alpha() {
+                  return DynamicImage::ImageRgb8(image.to_rgb8());
+              }
+
+              let rgba = image.to_rgba8();
+              let rgb = RgbImage::from_fn(rgba.width(), rgba.height(), |x, y| {
+                  let [r, g, b, a] = rgba.get_pixel(x, y).0;
+                  let a = a as u32;
+                  let blend = |c: u8| ((c as u32 * a + 255 * (255 - a) + 127) / 255) as u8;
+                  Rgb([blend(r), blend(g), blend(b)])
+              });
+
+              DynamicImage::ImageRgb8(rgb)
+          }
+
+          impl SimpleAddin for Addin {
+              fn name() -> &'static CStr1C {
+                  cstr1c!("ImageConverter")
+              }
+
+              fn save_error(&mut self, err: Option<Box<dyn Error>>) {
+                  self.last_error = err;
+              }
+
+              fn methods() -> &'static [addin1c::MethodInfo<Self>] {
+                  &[
+                      MethodInfo {
+                          name: cstr1c!("ConvertFile"),
+                          method: Methods::Method2(Self::convert_file),
+                      },
+                      MethodInfo {
+                          name: cstr1c!("ConvertBuffer"),
+                          method: Methods::Method3(Self::convert_buffer),
+                      },
+                  ]
+              }
+
+              fn properties() -> &'static [PropInfo<Self>] {
+                  &[PropInfo {
+                      name: cstr1c!("LastError"),
+                      getter: Some(Self::last_error),
+                      setter: None,
+                  }]
+              }
+          }
+          RUST
+          cat > src/.cargo/config.toml <<'TOML'
+          # Статическая линковка C runtime: DLL не будет зависеть от vcruntime140.dll
+          [target.x86_64-pc-windows-msvc]
+          rustflags = ["-C", "target-feature=+crt-static"]
+
+          [target.i686-pc-windows-msvc]
+          rustflags = ["-C", "target-feature=+crt-static"]
+          TOML
+      - name: Build
+        shell: bash
+        working-directory: src
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --target x86_64-pc-windows-msvc
+          cargo build --release --target i686-pc-windows-msvc
+          mkdir ../out
+          cp target/x86_64-pc-windows-msvc/release/addin_image_converter.dll ../out/ImageConverter_x64.dll
+          cp target/i686-pc-windows-msvc/release/addin_image_converter.dll ../out/ImageConverter_x86.dll
+          cp src/addin.rs ../out/addin.rs.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  bundle:
+    needs: [windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bundle
+          merge-multiple: true
+      - name: Create manifest
+        run: |
+          rm -f bundle/addin.rs.txt
+          cat > bundle/MANIFEST.XML <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <bundle xmlns="http://v8.1c.ru/8.2/addin/bundle">
+            <component os="Windows" path="ImageConverter_x64.dll" type="native" arch="x86_64"/>
+            <component os="Windows" path="ImageConverter_x86.dll" type="native" arch="i386"/>
+          </bundle>
+          XML
+          ls -la bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ImageConverter-1C
+          path: bundle/*
