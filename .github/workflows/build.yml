@@ -22,7 +22,7 @@ jobs:
           use image::{codecs::jpeg::JpegEncoder, DynamicImage, ImageFormat, Rgb, RgbImage};
 
           /// Качество JPEG (1-100). Стандартное значение библиотеки image - 75.
-          const JPEG_QUALITY: u8 = 90;
+          const JPEG_QUALITY: u8 = 98;
 
           pub struct Addin {
               last_error: Option<Box<dyn Error>>,
